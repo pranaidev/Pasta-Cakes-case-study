@@ -1,0 +1,197 @@
+# loading packages, constants and functions
+
+library(connectR)
+library(digest)
+library(openssl)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(plotly)
+library(tidyr)
+library(connectR)
+library(data.table)
+library(outliers)
+library(zoo)
+library(feather)
+library(sqldf)
+library(stringr)
+
+## importing data
+store <- read.csv("C:\\Users\\PDevulapalli\\Desktop\\Job search\\Big W case study\\store_lookup.csv")
+product <- read.csv("C:\\Users\\PDevulapalli\\Desktop\\Job search\\Big W case study\\product_lookup_updated.csv")
+causal <- read.csv("C:\\Users\\PDevulapalli\\Desktop\\Job search\\Big W case study\\causal_lookup.csv")
+trxn <- read.csv("C:\\Users\\PDevulapalli\\Desktop\\Job search\\Big W case study\\transactions.csv")
+
+##renaming column names
+names(trxn)[names(trxn) == 'Basket.ID'] <- "Basket_ID"
+names(trxn)[names(trxn) == 'Transaction.Date.Time'] <- "Transaction_DT"
+names(trxn)[names(trxn) == 'Dollar.Sales'] <- "Dollar_Sales"
+
+#converting to lower case
+names(trxn) <- tolower(names(trxn))
+
+#convert dollar sales to numeric
+trxn$dollar_sales <- sub('.','',trxn$dollar_sales)
+trxn$dollar_sales <- as.numeric(trxn$dollar_sales)
+
+# checking for anamolies
+t <- sqldf('select *
+           from trxn
+           where Basket_ID = "2016802"')
+# need to remove the basket ID
+
+trxn <- trxn[trxn$basket_id != 2016802,]
+
+# convert negative dollar sales to 0
+#trxn$dollar_sales[trxn$dollar_sales<0] <- 0.00
+trxn$dollar_sales <- replace(trxn$dollar_sales,trxn$dollar_sales<0,0)
+
+#joining dimension tables to fact table
+trxn_store <- merge(x = trxn, y = store, by= "store", all.x = TRUE)
+trxn_store_prod <- merge(x=trxn_store,y=product,by="upc", all.x = TRUE)
+final_trxn <- merge(x=trxn_store_prod,y=causal,by=c("upc","geography","store","week"),all.x = TRUE)
+
+#replacing nulls for feature and display desc
+final_trxn[c("feature_desc")][is.na(final_trxn[c("feature_desc")])] <- "Not on Feature"
+final_trxn[c("display_desc")][is.na(final_trxn[c("display_desc")])] <- "Not on Display"
+
+#check if any NAs still exist
+check <- sapply(final_trxn, function(x) sum(is.na(x)))
+
+#replace NA with 0
+final_trxn[is.na(final_trxn)] <- 0
+
+#sample final_trxn
+final_trxn_sample <- head(final_trxn,1000)
+
+#export data to analyze in tableau
+write.csv(final_trxn,"C:\\Users\\PDevulapalli\\Desktop\\Job search\\Big W case study\\Final_Data.csv", row.names = FALSE)
+
+write.csv(final_trxn_sample,"C:\\Users\\PDevulapalli\\Desktop\\Job search\\Big W case study\\Final_Sample_Data.csv", row.names = FALSE)
+#random checks
+t1 <- sqldf('select sum(dollar_sales)
+           from trxn
+            where household = "314575"')
+
+t2 <- sqldf('select *
+           from trxn
+            where dollar_sales = 0')
+
+t3 <- sqldf('select basket_id,product_description,product_size,count(basket_id)
+           from final_trxn
+            group by basket_id,product_description,product_size
+            having count(basket_id)>1')
+
+
+#market basket analysis - packages
+library(arules)
+library(arulesViz)
+
+#Market basket analysis at commodity level
+
+#subset data - basket and commodity
+comm <- sqldf('select distinct basket_id, commodity
+              from final_trxn')
+
+comm_sorted <- comm[order(comm$basket_id),]
+comm_sorted$basket_id <- as.numeric(comm_sorted$basket_id)
+comm_sorted$commodity <- as.factor(comm_sorted$commodity)
+
+#convert dateframe into basket format
+library(plyr)
+comm_itemList <- ddply(comm,c("basket_id"), 
+                     function(df1)paste(df1$commodity, 
+                                        collapse = ","))
+names(comm_itemList)[names(comm_itemList) == 'V1'] <- "CommodityList"
+
+comm_itemList$basket_id <- NULL
+
+write.csv(comm_itemList,"CommodityList.csv", quote = FALSE , row.names = TRUE)
+
+#read the file and convert to transaction format
+txn = read.transactions(file="CommodityList.csv", rm.duplicates= TRUE, format="basket",sep=",",cols=1)
+
+#remove quotes
+txn@itemInfo$labels <- gsub("\"","",txn@itemInfo$labels)
+
+#apriori algo
+basket_rules <- apriori(txn,parameter = list(sup = 0.001, conf = 0.5, target="rules"))
+
+#convert to dataframe
+comm_basket <- as(basket_rules,"data.frame")
+View(comm_basket)
+
+#comm_basket$confidence <- comm_basket$confidence * 100
+#comm_basket$support <- comm_basket$support * nrow(df)
+
+#split lhs and rhs into two columns
+#library(reshape2)
+#comm_basket <- transform(comm_basket, rules = colsplit(basket_rules, pattern = "=>", names = c("lhs","rhs")))
+
+write.csv(comm_basket,"C:\\Users\\PDevulapalli\\Desktop\\Job search\\Big W case study\\commodity_rules.csv", row.names = FALSE)
+
+library(arulesViz)
+plot(basket_rules)
+
+plot(basket_rules,measure=c("support","lift"),shading="confidence",engine='interactive')
+
+
+#sorting rules by confidence
+basket_rules<-sort(basket_rules, by="confidence", decreasing=TRUE)
+basket_rules #9 rules for conf=0.5
+
+
+#market basket analysis with brand commodity level
+comm_brand <- sqldf('select distinct basket_id, commodity, brand
+              from final_trxn')
+
+comm_brand$product <- paste(comm_brand$brand,comm_brand$commodity,sep=" ")
+comm_brand$commodity <- NULL
+comm_brand$brand <- NULL
+comm_brand$product <- sapply(comm_brand$product, tolower)
+
+comm_brand <- comm_brand[!duplicated(comm_brand), ]
+
+comm_brand_sorted <- comm_brand[order(comm$basket_id),]
+comm_sorted$basket_id <- as.numeric(comm_sorted$basket_id)
+comm_sorted$commodity <- as.factor(comm_sorted$commodity)
+
+comm_brand_itemList <- ddply(comm_brand_sorted,c("basket_id"), 
+                       function(df1)paste(df1$product, 
+                                          collapse = ","))
+
+names(comm_brand_itemList)[names(comm_brand_itemList) == 'V1'] <- "CommodityProdList"
+
+comm_brand_itemList$basket_id <- NULL
+
+#write.csv(comm_brand_itemList,"C:\\Users\\PDevulapalli\\Desktop\\Job search\\Big W case study\\CommodityProdList.csv", row.names = TRUE)
+
+write.csv(comm_brand_itemList,"CommodityProdList.csv", quote = FALSE , row.names = TRUE)
+
+#txn1 = read.transactions(file="C:\\Users\\PDevulapalli\\Desktop\\Job search\\Big W case study\\CommodityProdList.csv", rm.duplicates= TRUE, format="basket",sep=",",cols=1)
+
+txn1 = read.transactions(file="CommodityProdList.csv", rm.duplicates= TRUE, format="basket",sep=",",cols=1)
+
+txn1@itemInfo$labels <- gsub("\"","",txn1@itemInfo$labels)
+
+#basket_rules1 <- apriori(txn1,parameter = list(sup = 0.001, conf = 0.2, target="rules"))
+
+basket_rules2 <- apriori(txn1,parameter = list(sup = 0.001, conf = 0.1, target="rules"))
+
+#comm_prod_basket <- as(basket_rules1,"data.frame")
+#View(comm_prod_basket) #11 rules
+
+comm_prod_basket1 <- as(basket_rules2,"data.frame")
+View(comm_prod_basket1) #30 rules
+
+#plot(basket_rules1,measure=c("support","lift"),shading="confidence",engine='interactive')
+
+plot(basket_rules2,measure=c("support","lift"),shading="confidence",engine='interactive')
+
+#write.csv(comm_prod_basket,"C:\\Users\\PDevulapalli\\Desktop\\Job search\\Big W case study\\commodity_prod_rules.csv", row.names = FALSE)
+
+write.csv(comm_prod_basket1,"C:\\Users\\PDevulapalli\\Desktop\\Job search\\Big W case study\\commodity_prod_rules1.csv", row.names = FALSE)
+
+basket_rules3 <- apriori(txn1,parameter = list(sup = 0.001, conf = 0.01, target="rules"))
+
+
